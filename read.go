@@ -10,14 +10,17 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/rc4"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/ascii85"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 )
@@ -33,6 +36,7 @@ type Reader struct {
 	useAES          bool
 	encVersion      int    // encryption version (V), 0 if not encrypted
 	encKey          []byte // File Encryption Key (FEK) - for V=5 calls this is the final key
+	plainMetadata   bool   // the document metadata stream is not encrypted (/EncryptMetadata false)
 	XrefInformation ReaderXrefInformation
 	PDFVersion      string
 	closer          io.Closer
@@ -40,6 +44,9 @@ type Reader struct {
 	// objCache caches resolved objects to prevent repetitive disk I/O.
 	// Map key is the object ID.
 	objCache map[uint32]Value
+
+	// objStms holds the object streams being searched, to detect cycles.
+	objStms []objptr
 }
 
 type ReaderXrefInformation struct {
@@ -140,7 +147,19 @@ func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 // If the PDF is encrypted, NewReaderEncrypted calls pw repeatedly to obtain passwords
 // to try. If pw returns the empty string, NewReaderEncrypted stops trying to decrypt
 // the file and returns an error.
-func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, error) {
+func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			r = nil
+			if err, _ = e.(error); err == nil {
+				err = fmt.Errorf("malformed PDF: %v", e)
+			}
+		}
+	}()
+	return newReaderEncrypted(f, size, pw)
+}
+
+func newReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, error) {
 	buf := make([]byte, 10)
 	f.ReadAt(buf, 0)
 	if (!bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7') && (!bytes.HasPrefix(buf, []byte("%PDF-2.")) || buf[7] < '0' || buf[7] > '0') {
@@ -160,15 +179,8 @@ EOFDetect:
 		buf = make([]byte, searchSize)
 
 		searchSizeRead, _ = f.ReadAt(buf, end-searchSize)
-		for len(buf) > 0 && buf[len(buf)-1] == '\n' || buf[len(buf)-1] == '\r' {
-			buf = buf[:len(buf)-1]
-		}
 		buf = bytes.TrimRight(buf, "\r\n\t ")
-		for {
-			if len(buf) == 5 {
-				break
-			}
-
+		for len(buf) >= 5 {
 			if bytes.HasSuffix(buf, []byte("%%EOF")) {
 				break EOFDetect
 			}
@@ -300,8 +312,14 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 		return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: xref stream missing Size")
 	}
 	size := sizeObj.Int64Val
+	if size < 0 {
+		return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: negative xref stream Size")
+	}
 
-	table := make([]xref, size)
+	// The table grows as the entries are read, so /Size only gives the initial
+	// capacity: a file that declares more objects than it can hold must not
+	// make the table that large.
+	table := make([]xref, 0, min(size, r.end, 4096))
 
 	table, err := readXrefStreamData(r, strm, table, size)
 	if err != nil {
@@ -349,8 +367,6 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 
 	// Save the xref type. Useful for adding data to it.
 	r.XrefInformation.Type = "stream"
-	r.XrefInformation.ItemCount = size
-
 	r.XrefInformation.ItemCount = int64(len(table))
 
 	return table, strmptr, strm, nil
@@ -410,9 +426,12 @@ func readXrefStreamData(r *Reader, strm Object, table []xref, size int64) ([]xre
 
 			v2 := decodeInt(buf[w[0] : w[0]+w[1]])
 			v3 := decodeInt(buf[w[0]+w[1] : w[0]+w[1]+w[2]])
-			x := int(start) + i
-			for cap(table) <= x {
-				table = append(table[:cap(table)], xref{})
+			x, err := xrefIndex(start+int64(i), r.end)
+			if err != nil {
+				return nil, err
+			}
+			for len(table) <= x {
+				table = append(table, xref{})
 			}
 			if table[x].ptr != (objptr{}) {
 				continue
@@ -443,7 +462,7 @@ func decodeInt(b []byte) int {
 func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 	var table []xref
 
-	table, err := readXrefTableData(b, table)
+	table, err := readXrefTableData(b, table, r.end)
 	if err != nil {
 		return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: %v", err)
 	}
@@ -482,7 +501,7 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 		if tok.Kind != Keyword || tok.KeywordVal != "xref" {
 			return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: xref Prev does not point to xref")
 		}
-		table, err = readXrefTableData(b, table)
+		table, err = readXrefTableData(b, table, r.end)
 		if err != nil {
 			return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: %v", err)
 		}
@@ -519,7 +538,17 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 	return table, objptr{}, trailer, nil
 }
 
-func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
+// xrefIndex returns the object number x as an index into the cross-reference
+// table of a file of end bytes. Every object needs at least one byte in the
+// file, so a larger object number is malformed.
+func xrefIndex(x, end int64) (int, error) {
+	if x < 0 || x >= end {
+		return 0, fmt.Errorf("object number %d in a file of %d bytes", x, end)
+	}
+	return int(x), nil
+}
+
+func readXrefTableData(b *buffer, table []xref, end int64) ([]xref, error) {
 	for {
 		tok := b.readToken()
 		if tok.Kind == Keyword && tok.KeywordVal == "trailer" {
@@ -549,12 +578,12 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 			if alloc != "f" && alloc != "n" {
 				return nil, fmt.Errorf("malformed xref table entry: invalid type %q", alloc)
 			}
-			x := int(start) + i
-			for cap(table) <= x {
-				table = append(table[:cap(table)], xref{})
+			x, err := xrefIndex(start+int64(i), end)
+			if err != nil {
+				return nil, err
 			}
-			if len(table) <= x {
-				table = table[:x+1]
+			for len(table) <= x {
+				table = append(table, xref{})
 			}
 			if alloc == "n" && table[x].offset == 0 {
 				table[x] = xref{ptr: objptr{uint32(x), uint16(gen)}, offset: int64(off)}
@@ -638,6 +667,34 @@ func objfmt(x Object) string {
 	}
 }
 
+// objectInStream returns the object ptr from the object stream strm, and
+// whether the stream holds it.
+func (r *Reader) objectInStream(strm Value, ptr objptr) (Object, bool) {
+	if strm.Kind() != Stream {
+		panic("not a stream")
+	}
+	if strm.Key("Type").Name() != "ObjStm" {
+		panic("not an object stream")
+	}
+	n := int(strm.Key("N").Int64())
+	first := strm.Key("First").Int64()
+	if first == 0 {
+		panic("missing First")
+	}
+	b := newBuffer(strm.Reader(), 0, r.encVersion)
+	defer bufferPool.Put(b)
+	b.allowEOF = true
+	for i := 0; i < n && !b.eof; i++ {
+		id := b.readToken().Int64Val
+		off := b.readToken().Int64Val
+		if uint32(id) == ptr.id {
+			b.seekForward(first + off)
+			return b.readObject(), true
+		}
+	}
+	return Object{}, false
+}
+
 func (r *Reader) resolve(parent objptr, x Object) (v Value) {
 	defer func() {
 		if e := recover(); e != nil {
@@ -661,39 +718,31 @@ func (r *Reader) resolve(parent objptr, x Object) (v Value) {
 		}
 		var obj Object
 		if xref.inStream {
+			if slices.Contains(r.objStms, xref.stream) {
+				panic("cyclic object streams")
+			}
+			// An object stream is a stream, and a stream is never stored in an
+			// object stream (ISO 32000-1, 7.5.7).
+			if s := xref.stream.id; s < uint32(len(r.xref)) && r.xref[s].inStream {
+				panic("object stream in an object stream")
+			}
+			r.objStms = append(r.objStms, xref.stream)
+			defer func() { r.objStms = r.objStms[:len(r.objStms)-1] }()
 			strm := r.resolve(parent, Object{Kind: Indirect, PtrVal: xref.stream})
-		Search:
+			// The object stream is searched first, then the chain of the object
+			// streams it extends, each of them only once.
+			var extends []objptr
 			for {
-				if strm.Kind() != Stream {
-					panic("not a stream")
-				}
-				if strm.Key("Type").Name() != "ObjStm" {
-					panic("not an object stream")
-				}
-				n := int(strm.Key("N").Int64())
-				first := strm.Key("First").Int64()
-				if first == 0 {
-					panic("missing First")
-				}
-				b := newBuffer(strm.Reader(), 0, r.encVersion)
-				defer bufferPool.Put(b)
-				b.allowEOF = true
-				for i := 0; i < n; i++ {
-					idObj := b.readToken()
-					offObj := b.readToken()
-					id := idObj.Int64Val
-					off := offObj.Int64Val
-
-					if uint32(id) == ptr.id {
-						b.seekForward(first + off)
-						x = b.readObject()
-						break Search
-					}
+				var found bool
+				if x, found = r.objectInStream(strm, ptr); found {
+					break
 				}
 				ext := strm.Key("Extends")
-				if ext.Kind() != Stream {
+				next := ext.obj.PtrVal
+				if ext.Kind() != Stream || next == xref.stream || slices.Contains(extends, next) {
 					panic("cannot find object in stream")
 				}
+				extends = append(extends, next)
 				strm = ext
 			}
 		} else {
@@ -703,6 +752,12 @@ func (r *Reader) resolve(parent objptr, x Object) (v Value) {
 			b.useAES = r.useAES
 
 			obj = b.readObject()
+			if b.key != nil && obj.Kind == Stream && obj.DictVal["Type"].NameVal == "XRef" {
+				// The strings of a cross-reference stream are not encrypted.
+				b = newBuffer(io.NewSectionReader(r.f, xref.offset, r.end-xref.offset), xref.offset, r.encVersion)
+				defer bufferPool.Put(b)
+				obj = b.readObject()
+			}
 			// readObject handles the "objdef" structure internally by returning the Object
 			// but storing the definition ID in PtrVal if it was an indirect definition.
 			// Let's verify it matches the pointer we expected.
@@ -770,7 +825,7 @@ func newStreamReader(s Object, r *Reader) io.ReadCloser {
 
 	rd = io.NewSectionReader(r.f, s.StreamOffset, length)
 
-	if r.key != nil {
+	if r.key != nil && !r.unencryptedStream(s) {
 		var err error
 		// We need the stream's object ID for decryption.
 		// Use s.PtrVal which should be set to definition ID if it was read via readObject.
@@ -803,10 +858,42 @@ func newStreamReader(s Object, r *Reader) io.ReadCloser {
 	return ioutil.NopCloser(rd)
 }
 
+// unencryptedStream reports whether s is not encrypted in an encrypted document:
+// a cross-reference stream, the metadata stream of the catalog when
+// /EncryptMetadata is false, or a stream with the Identity crypt filter.
+func (r *Reader) unencryptedStream(s Object) bool {
+	switch s.DictVal["Type"].NameVal {
+	case "XRef":
+		return true
+	case "Metadata":
+		if r.plainMetadata && s.PtrVal == r.resolve(objptr{}, r.trailer.DictVal["Root"]).obj.DictVal["Metadata"].PtrVal {
+			return true
+		}
+	}
+	val := Value{r: r, obj: s}
+	filter, params := val.Key("Filter"), val.Key("DecodeParms")
+	if filter.Kind() == Array {
+		// A Crypt filter comes first.
+		filter = filter.Index(0)
+	}
+	// One filter may have a single DecodeParms dictionary instead of an array.
+	if params.Kind() == Array {
+		params = params.Index(0)
+	}
+	if filter.Name() != "Crypt" {
+		return false
+	}
+	name := params.Key("Name").Name()
+	return name == "" || name == "Identity"
+}
+
 func applyFilter(rd io.Reader, name string, param Value) (io.Reader, error) {
 	switch name {
 	default:
 		return nil, fmt.Errorf("unknown filter %s", name)
+	case "Crypt":
+		// newStreamReader decrypts the stream.
+		return rd, nil
 	case "ASCIIHexDecode":
 		return asciiHexReader{rd}, nil
 	case "ASCII85Decode":
@@ -927,23 +1014,28 @@ func (r *Reader) initEncrypt(password string) error {
 	if encrypt["Filter"].NameVal != "Standard" {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(Object{Kind: Name, NameVal: encrypt["Filter"].NameVal}))
 	}
-	n := encrypt["Length"].Int64Val
-	if n == 0 {
-		n = 40
-	}
-	// For V=5 (AES-256), Length is usually 256.
-	if n%8 != 0 || n > 256 || n < 40 {
-		return fmt.Errorf("malformed PDF: %d-bit encryption key", n)
-	}
 	V := encrypt["V"].Int64Val
 
 	// Support V=5
 	if V != 1 && V != 2 && V != 4 && V != 5 {
 		return fmt.Errorf("unsupported PDF: encryption version V=%d", V)
 	}
-	if V == 4 && !okayV4(encrypt) {
-		return fmt.Errorf("unsupported PDF: encryption version V=%d", V)
+	useAES := false
+	if V >= 4 {
+		stmf := r.cryptFilterMethod(encrypt, encrypt["StmF"].NameVal)
+		strf := r.cryptFilterMethod(encrypt, encrypt["StrF"].NameVal)
+		switch {
+		case stmf != strf:
+			return fmt.Errorf("unsupported PDF: crypt filter methods %s for streams and %s for strings", stmf, strf)
+		case V == 4 && stmf == "V2":
+		case stmf == "AESV2", V == 5 && stmf == "AESV3":
+			useAES = true
+		default:
+			return fmt.Errorf("unsupported PDF: crypt filter method %s for V=%d", stmf, V)
+		}
 	}
+
+	r.plainMetadata = V >= 4 && encrypt["EncryptMetadata"].Kind == Bool && !encrypt["EncryptMetadata"].BoolVal
 
 	// If V=5, delegate to V5 authentication
 	if V == 5 {
@@ -972,68 +1064,129 @@ func (r *Reader) initEncrypt(password string) error {
 	}
 	P := uint32(encrypt["P"].Int64Val)
 
-	// TODO: Password should be converted to Latin-1.
-	pw := []byte(password)
-	h := md5.New()
-	if len(pw) >= 32 {
-		h.Write(pw[:32])
-	} else {
-		h.Write(pw)
-		h.Write(passwordPad[:32-len(pw)])
+	// Only V=2 and V=3 use /Length. Revision 2 always has a 40-bit key, unlike
+	// in qpdf, which takes /Length for it too.
+	var keyLen int
+	switch {
+	case V == 4:
+		keyLen = 16
+	case V == 1 || R == 2:
+		keyLen = 5
+	default:
+		n := encrypt["Length"].Int64Val
+		if n == 0 {
+			n = 40
+		}
+		if n%8 != 0 || n < 40 || n > 128 {
+			return fmt.Errorf("malformed PDF: %d-bit encryption key", n)
+		}
+		keyLen = int(n / 8)
 	}
-	h.Write([]byte(O))
-	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
-	h.Write([]byte(ID))
-	key := h.Sum(nil)
+	authenticate := func(pw []byte) ([]byte, bool) {
+		key, ok := authenticateUserPassword(R, keyLen, pw, []byte(O), []byte(U), P, ID, !r.plainMetadata)
+		// Like Acrobat, do not accept an empty owner password for a document
+		// that has a user password.
+		if !ok && len(pw) > 0 {
+			userPassword := ownerToUserPassword(R, keyLen, pw, []byte(O))
+			key, ok = authenticateUserPassword(R, keyLen, userPassword, []byte(O), []byte(U), P, ID, !r.plainMetadata)
+		}
+		return key, ok
+	}
+	pw := []byte(password)
+	if encoded, ok := pdfDocEncode(password); ok {
+		pw = encoded
+	}
+	key, ok := authenticate(pw)
+	if !ok && string(pw) != password {
+		// Some writers use UTF-8 instead of PDFDocEncoding.
+		key, ok = authenticate([]byte(password))
+	}
+	if !ok {
+		return ErrInvalidPassword
+	}
 
+	r.key = key
+	r.useAES = useAES
+	r.encVersion = int(V)
+
+	return nil
+}
+
+// padPassword pads or truncates a password to 32 bytes (Algorithm 2, step a).
+func padPassword(pw []byte) []byte {
+	padded := make([]byte, 32)
+	n := copy(padded, pw)
+	copy(padded[n:], passwordPad)
+	return padded
+}
+
+// rc4Rounds applies RC4 with key XORed with each of the given counters in turn.
+func rc4Rounds(key, data []byte, counters []byte) {
+	key1 := make([]byte, len(key))
+	for _, i := range counters {
+		for j := range key {
+			key1[j] = key[j] ^ i
+		}
+		c, _ := rc4.NewCipher(key1)
+		c.XORKeyStream(data, data)
+	}
+}
+
+// authenticateUserPassword computes the file key for a user password
+// (Algorithm 2) and checks it against U (Algorithms 4 and 5).
+func authenticateUserPassword(R int64, keyLen int, pw, O, U []byte, P uint32, ID []byte, encryptMetadata bool) (key []byte, ok bool) {
+	h := md5.New()
+	h.Write(padPassword(pw))
+	h.Write(O)
+	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
+	h.Write(ID)
+	if R >= 4 && !encryptMetadata {
+		h.Write([]byte{0xff, 0xff, 0xff, 0xff})
+	}
+	key = h.Sum(nil)
 	if R >= 3 {
 		for i := 0; i < 50; i++ {
 			h.Reset()
-			h.Write(key[:n/8])
+			h.Write(key[:keyLen])
 			key = h.Sum(key[:0])
 		}
-		key = key[:n/8]
-	} else {
-		key = key[:40/8]
 	}
-
-	c, err := rc4.NewCipher(key)
-	if err != nil {
-		return fmt.Errorf("malformed PDF: invalid RC4 key: %v", err)
-	}
+	key = key[:keyLen]
 
 	var u []byte
 	if R == 2 {
 		u = make([]byte, 32)
 		copy(u, passwordPad)
-		c.XORKeyStream(u, u)
+		rc4Rounds(key, u, []byte{0})
 	} else {
 		h.Reset()
 		h.Write(passwordPad)
-		h.Write([]byte(ID))
+		h.Write(ID)
 		u = h.Sum(nil)
-		c.XORKeyStream(u, u)
+		rc4Rounds(key, u, []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19})
+	}
+	return key, bytes.HasPrefix(U, u)
+}
 
-		for i := 1; i <= 19; i++ {
-			key1 := make([]byte, len(key))
-			copy(key1, key)
-			for j := range key1 {
-				key1[j] ^= byte(i)
-			}
-			c, _ = rc4.NewCipher(key1)
-			c.XORKeyStream(u, u)
+// ownerToUserPassword decrypts O with the key derived from an owner password,
+// giving the padded user password if the owner password is correct (Algorithm 7).
+func ownerToUserPassword(R int64, keyLen int, pw, O []byte) []byte {
+	sum := md5.Sum(padPassword(pw))
+	if R >= 3 {
+		// Hash only the first keyLen bytes, as Acrobat does.
+		for i := 0; i < 50; i++ {
+			sum = md5.Sum(sum[:keyLen])
 		}
 	}
+	key := sum[:keyLen]
 
-	if !bytes.HasPrefix([]byte(U), u) {
-		return ErrInvalidPassword
+	userPassword := bytes.Clone(O)
+	if R == 2 {
+		rc4Rounds(key, userPassword, []byte{0})
+	} else {
+		rc4Rounds(key, userPassword, []byte{19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0})
 	}
-
-	r.key = key
-	r.useAES = V == 4
-	r.encVersion = int(V)
-
-	return nil
+	return userPassword
 }
 
 func (r *Reader) initEncryptV5(password string, encrypt map[string]Object) error {
@@ -1046,17 +1199,23 @@ func (r *Reader) initEncryptV5(password string, encrypt map[string]Object) error
 	UE := encrypt["UE"].StringVal
 	// Perms := encrypt["Perms"].StringVal
 
-	// Standard check for V=5 string lengths
-	if len(O) != 48 || len(U) != 48 || len(OE) != 32 || len(UE) != 32 {
+	// Like Acrobat, use the prefix of longer values.
+	if len(O) < 48 || len(U) < 48 || len(OE) < 32 || len(UE) < 32 {
 		return fmt.Errorf("malformed PDF V=5: invalid O/U/OE/UE length")
+	}
+	O, U, OE, UE = O[:48], U[:48], OE[:32], UE[:32]
+
+	R := encrypt["R"].Int64Val
+	if R != 5 && R != 6 {
+		return fmt.Errorf("unsupported PDF: encryption revision R=%d for V=5", R)
 	}
 
 	// Authenticate
 	// Try User Password (U)
-	key, ok := authenticateV5Password(password, []byte(U), []byte(UE))
-	if !ok {
+	key, ok := authenticateV5Password(R, password, []byte(U), []byte(UE), nil)
+	if !ok && password != "" {
 		// Try Owner Password (O)
-		key, ok = authenticateV5Password(password, []byte(O), []byte(OE))
+		key, ok = authenticateV5Password(R, password, []byte(O), []byte(OE), []byte(U))
 	}
 
 	if !ok {
@@ -1070,7 +1229,7 @@ func (r *Reader) initEncryptV5(password string, encrypt map[string]Object) error
 	return nil
 }
 
-func authenticateV5Password(password string, entry []byte, payload []byte) (fek []byte, ok bool) {
+func authenticateV5Password(revision int64, password string, entry, payload, udata []byte) (fek []byte, ok bool) {
 	// entry is 48 bytes: 32 hash + 8 val salt + 8 key salt
 	if len(entry) != 48 {
 		return nil, false
@@ -1086,24 +1245,12 @@ func authenticateV5Password(password string, entry []byte, payload []byte) (fek 
 	}
 
 	// 1. Validate Password
-	h := sha256.New()
-	h.Write(pwdBytes)
-	h.Write(valSalt)
-	hashComputed := h.Sum(nil)
-
-	if !bytes.Equal(hashComputed, hashStored) {
+	if !bytes.Equal(hashV5(revision, pwdBytes, valSalt, udata), hashStored) {
 		return nil, false
 	}
 
 	// 2. Decrypt FEK (payload) using derived key
-	// Key = SHA256(pwd + KeySalt)
-	h.Reset()
-	h.Write(pwdBytes)
-	h.Write(keySalt)
-	kdk := h.Sum(nil) // 32 bytes Key Derivation Key
-
-	// Decrypt payload (UE or OE) using AES-256-CBC with zero IV
-	block, err := aes.NewCipher(kdk)
+	block, err := aes.NewCipher(hashV5(revision, pwdBytes, keySalt, udata))
 	if err != nil {
 		return nil, false
 	}
@@ -1117,41 +1264,71 @@ func authenticateV5Password(password string, entry []byte, payload []byte) (fek 
 	return plaintext, true
 }
 
+func hashV5(revision int64, password, salt, udata []byte) []byte {
+	h := sha256.New()
+	h.Write(password)
+	h.Write(salt)
+	h.Write(udata)
+	k := h.Sum(nil)
+	if revision < 6 {
+		return k
+	}
+
+	for round := 0; ; round++ {
+		seq := make([]byte, 0, len(password)+len(k)+len(udata))
+		seq = append(seq, password...)
+		seq = append(seq, k...)
+		seq = append(seq, udata...)
+		k1 := bytes.Repeat(seq, 64)
+
+		block, _ := aes.NewCipher(k[:16])
+		e := make([]byte, len(k1))
+		cipher.NewCBCEncrypter(block, k[16:32]).CryptBlocks(e, k1)
+
+		sum := 0
+		for _, b := range e[:16] {
+			sum += int(b)
+		}
+		switch sum % 3 {
+		case 0:
+			s := sha256.Sum256(e)
+			k = s[:]
+		case 1:
+			s := sha512.Sum384(e)
+			k = s[:]
+		case 2:
+			s := sha512.Sum512(e)
+			k = s[:]
+		}
+
+		if round >= 63 && int(e[len(e)-1]) <= round-31 {
+			break
+		}
+	}
+	return k[:32]
+}
+
 var ErrInvalidPassword = fmt.Errorf("encrypted PDF: invalid password")
 
-func okayV4(encrypt map[string]Object) bool {
-	cfGen := encrypt["CF"]
-	if cfGen.Kind != Dict {
-		return false
+// cryptFilterMethod returns the method of the named crypt filter, such as AESV2,
+// None if it has no method, or Identity if it does not encrypt.
+func (r *Reader) cryptFilterMethod(encrypt map[string]Object, name string) string {
+	if name == "" || name == "Identity" {
+		return "Identity"
 	}
-	cf := cfGen.DictVal
-	stmf := encrypt["StmF"].NameVal
-	strf := encrypt["StrF"].NameVal
-	if stmf != strf {
-		return false
+	method := r.resolve(objptr{}, encrypt["CF"]).Key(name).Key("CFM")
+	if method.Kind() != Name {
+		return "None"
 	}
-	cfparamGen := cf[stmf]
-	if cfparamGen.Kind != Dict {
-		return false
-	}
-	cfparam := cfparamGen.DictVal
+	return method.Name()
+}
 
-	if val, ok := cfparam["AuthEvent"]; ok {
-		if val.Kind != Name || val.NameVal != "DocOpen" {
-			return false
-		}
+// objectKey returns the key for the strings and streams of object ptr (Algorithm 1).
+func objectKey(key []byte, useAES bool, encVersion int, ptr objptr) []byte {
+	if encVersion < 5 {
+		return cryptKey(key, useAES, ptr)
 	}
-	if val, ok := cfparam["Length"]; ok {
-		if val.Kind != Integer || val.Int64Val != 16 {
-			return false
-		}
-	}
-	if val, ok := cfparam["CFM"]; ok {
-		if val.Kind != Name || val.NameVal != "AESV2" {
-			return false
-		}
-	}
-	return true
+	return key
 }
 
 func cryptKey(key []byte, useAES bool, ptr objptr) []byte {
@@ -1161,57 +1338,85 @@ func cryptKey(key []byte, useAES bool, ptr objptr) []byte {
 	if useAES {
 		h.Write([]byte("sAlT"))
 	}
-	return h.Sum(nil)
+	return h.Sum(nil)[:min(len(key)+5, md5.Size)]
 }
 
-func decryptString(key []byte, useAES bool, encVersion int, ptr objptr, x string) (string, error) {
-	if encVersion < 5 {
-		key = cryptKey(key, useAES, ptr)
+// IsEncrypted reports whether the document is encrypted.
+func (r *Reader) IsEncrypted() bool {
+	return r.key != nil
+}
+
+// EncryptsMetadata reports whether the metadata stream of the document catalog
+// is encrypted, which /EncryptMetadata false turns off.
+func (r *Reader) EncryptsMetadata() bool {
+	return r.key != nil && !r.plainMetadata
+}
+
+// Encrypt encrypts a string or stream of the object ptr with the document's key.
+// Some data of an encrypted document stays unencrypted and must not be passed to
+// Encrypt: cross-reference streams and their strings, the Contents of signature
+// dictionaries, the strings of objects in object streams, streams whose first
+// filter is /Crypt with the /Identity crypt filter or no /Name, and the metadata
+// stream of the catalog if EncryptsMetadata reports false.
+func (r *Reader) Encrypt(ptr Ptr, data []byte) ([]byte, error) {
+	if r.key == nil {
+		return nil, fmt.Errorf("encrypt: document is not encrypted")
 	}
-	// For V=5, key is already the FEK (32 bytes for AES-256)
+	key := objectKey(r.key, r.useAES, r.encVersion, objptr(ptr))
+
+	if !r.useAES {
+		c, _ := rc4.NewCipher(key)
+		out := make([]byte, len(data))
+		c.XORKeyStream(out, data)
+		return out, nil
+	}
+
+	block, _ := aes.NewCipher(key)
+	padLen := aes.BlockSize - len(data)%aes.BlockSize
+	out := make([]byte, aes.BlockSize+len(data)+padLen)
+	iv := out[:aes.BlockSize]
+	if _, err := rand.Read(iv); err != nil {
+		return nil, fmt.Errorf("encrypt: generating IV: %v", err)
+	}
+	body := out[aes.BlockSize:]
+	copy(body, data)
+	for i := len(data); i < len(body); i++ {
+		body[i] = byte(padLen)
+	}
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(body, body)
+	return out, nil
+}
+
+// decryptString decrypts a string of the object ptr. A string that is too short
+// to hold a complete ciphertext decrypts to the empty string.
+func decryptString(key []byte, useAES bool, encVersion int, ptr objptr, x string) string {
+	key = objectKey(key, useAES, encVersion, ptr)
 
 	if useAES {
 		data := []byte(x)
-		if len(data) < aes.BlockSize {
-			return "", nil
+		if len(data) <= aes.BlockSize {
+			return ""
 		}
 		iv := data[:aes.BlockSize]
 		ciphertext := data[aes.BlockSize:]
-
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			return "", err
-		}
-
 		if len(ciphertext)%aes.BlockSize != 0 {
-			// return "", fmt.Errorf("decryption error: ciphertext not a multiple of block size")
-			// Try to handle gracefully?
-			return "", nil
+			return ""
 		}
 
+		block, _ := aes.NewCipher(key)
 		mode := cipher.NewCBCDecrypter(block, iv)
 		mode.CryptBlocks(ciphertext, ciphertext)
 
-		padLen := int(ciphertext[len(ciphertext)-1])
-		if padLen > aes.BlockSize || padLen == 0 {
-			// return "", fmt.Errorf("decryption error: invalid padding")
-			// Handle graceful
-			return string(ciphertext), nil
-		}
-		return string(ciphertext[:len(ciphertext)-padLen]), nil
-	} else {
-		c, _ := rc4.NewCipher(key)
-		data := []byte(x)
-		c.XORKeyStream(data, data)
-		x = string(data)
+		return string(unpad(ciphertext))
 	}
-	return x, nil
+	c, _ := rc4.NewCipher(key)
+	data := []byte(x)
+	c.XORKeyStream(data, data)
+	return string(data)
 }
 
 func decryptStream(key []byte, useAES bool, encVersion int, ptr objptr, rd io.Reader) (io.Reader, error) {
-	if encVersion < 5 {
-		key = cryptKey(key, useAES, ptr)
-	}
+	key = objectKey(key, useAES, encVersion, ptr)
 
 	if useAES {
 		block, err := aes.NewCipher(key)
@@ -1225,43 +1430,80 @@ func decryptStream(key []byte, useAES bool, encVersion int, ptr objptr, rd io.Re
 		}
 
 		cbc := cipher.NewCBCDecrypter(block, iv)
-		return &cbcReader{cbc: cbc, rd: rd, buf: make([]byte, aes.BlockSize)}, nil
+		return &cbcReader{cbc: cbc, rd: rd}, nil
 	}
 	c, _ := rc4.NewCipher(key)
 	return &rc4Reader{cipher: c, rd: rd}, nil
 }
 
+// cbcReader decrypts an AES-CBC stream. It holds back each decrypted block
+// until the next one is read, to remove the padding from the last block.
 type cbcReader struct {
-	cbc  cipher.BlockMode
-	rd   io.Reader
-	buf  []byte
-	pend []byte
+	cbc   cipher.BlockMode
+	rd    io.Reader
+	block [aes.BlockSize]byte
+	held  bool
+	next  [aes.BlockSize]byte
+	out   [aes.BlockSize]byte
+	pend  []byte
+	err   error
 }
 
 func (r *cbcReader) Read(b []byte) (n int, err error) {
-	if len(r.pend) > 0 {
-		n = copy(b, r.pend)
-		r.pend = r.pend[n:]
-		return n, nil
-	}
-
-	_, err = io.ReadFull(r.rd, r.buf)
-	if err != nil {
-		if err == io.EOF {
-			return 0, io.EOF
+	for len(r.pend) == 0 {
+		if r.err != nil {
+			return 0, r.err
 		}
-		if err == io.ErrUnexpectedEOF {
-			return 0, fmt.Errorf("encrypted stream not a multiple of block size")
+		var tail int
+		tail, err = io.ReadFull(r.rd, r.next[:])
+		switch err {
+		case nil:
+			r.cbc.CryptBlocks(r.next[:], r.next[:])
+			if r.held {
+				r.out = r.block
+				r.pend = r.out[:]
+			}
+			r.block, r.held = r.next, true
+			continue
+		case io.EOF, io.ErrUnexpectedEOF:
+			// Like pdf.js, ignore bytes after the last complete block, such as
+			// an end-of-line marker that /Length counts. Anything else means
+			// that /Length cut the stream short.
+			r.err = io.EOF
+			for _, c := range r.next[:tail] {
+				if !isSpace(c) {
+					r.err = fmt.Errorf("encrypted stream not a multiple of block size")
+					break
+				}
+			}
+		default:
+			r.err = err
+			return 0, err
 		}
-		return 0, err
+		if r.held {
+			r.out = r.block
+			r.pend = unpad(r.out[:])
+		}
 	}
-
-	r.cbc.CryptBlocks(r.buf, r.buf)
-	r.pend = r.buf
 
 	n = copy(b, r.pend)
 	r.pend = r.pend[n:]
 	return n, nil
+}
+
+// unpad removes PKCS#7 padding from decrypted data. Like qpdf and pdf.js, it
+// keeps data that does not end with valid padding.
+func unpad(data []byte) []byte {
+	n := int(data[len(data)-1])
+	if n == 0 || n > aes.BlockSize || n > len(data) {
+		return data
+	}
+	for _, c := range data[len(data)-n:] {
+		if int(c) != n {
+			return data
+		}
+	}
+	return data[:len(data)-n]
 }
 
 type rc4Reader struct {
