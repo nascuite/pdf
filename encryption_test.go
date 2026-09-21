@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -295,10 +296,30 @@ func TestDecryptStreamShortLength(t *testing.T) {
 	// stream, but one that ends in the middle of a block must not be read as
 	// if the data ended there.
 	for _, cut := range []int{1, 8, 15} {
-		got, err := readStreamData(r, nil, enc[:len(enc)-cut])
+		data := slices.Clone(enc[:len(enc)-cut])
+		// The IV is random, so the bytes after the last complete block may
+		// happen to be whitespace, which reads as an end-of-line marker.
+		for i := len(data) - len(data)%aes.BlockSize; i < len(data); i++ {
+			if isSpace(data[i]) {
+				data[i] = 'x'
+			}
+		}
+		got, err := readStreamData(r, nil, data)
 		if err == nil {
 			t.Errorf("read of a stream %d bytes short = %q, %v; want an error", cut, got, err)
 		}
+	}
+}
+
+func TestDecryptEmptyStreamWithEOL(t *testing.T) {
+	r := &Reader{key: bytes.Repeat([]byte{0x11}, 16), useAES: true, encVersion: 4}
+	for _, data := range []string{"", "\n", "\r\n"} {
+		if got, err := readStreamData(r, nil, []byte(data)); got != "" || err != nil {
+			t.Errorf("read of %q = %q, %v; want an empty stream", data, got, err)
+		}
+	}
+	if got, err := readStreamData(r, nil, []byte("0123456789")); err == nil {
+		t.Errorf("read of a stream shorter than the IV = %q, nil; want an error", got)
 	}
 }
 
@@ -329,7 +350,8 @@ func setObjects(r *Reader, objects ...string) {
 
 func TestCryptFilter(t *testing.T) {
 	const content = "BT /F1 12 Tf 20 100 Td (Hello secret world) Tj ET"
-	r := &Reader{key: bytes.Repeat([]byte{0x11}, 16), useAES: true, encVersion: 4}
+	r := &Reader{key: bytes.Repeat([]byte{0x11}, 16), useAES: true, encVersion: 4,
+		cryptFilters: map[string]string{"StdCF": "AESV2"}}
 	encrypted, err := r.Encrypt(NewPtr(12, 0), []byte(content))
 	if err != nil {
 		t.Fatal(err)
@@ -389,6 +411,119 @@ func TestCryptFilter(t *testing.T) {
 				t.Errorf("read %q, %v; want %q, nil", got, err, content)
 			}
 		})
+	}
+}
+
+// TestNamedCryptFilterMethod reads streams that name a crypt filter of the
+// document other than the one that /StmF names, which must be read with the
+// method of the filter they name.
+func TestNamedCryptFilterMethod(t *testing.T) {
+	const content = "BT /F1 12 Tf 20 100 Td (Hello secret world) Tj ET"
+	key := bytes.Repeat([]byte{0x11}, 16)
+	name := func(n string) Object { return Object{Kind: Name, NameVal: n} }
+
+	// The document encrypts its streams with AESV2 and also defines a crypt
+	// filter for RC4 and one that does not encrypt.
+	r := &Reader{key: key, useAES: true, encVersion: 4, cryptFilters: map[string]string{
+		"StdCF": "AESV2", "RC4F": "V2", "NoneF": "None",
+	}}
+	aes, err := r.Encrypt(NewPtr(12, 0), []byte(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc4Doc := &Reader{key: key, useAES: false, encVersion: 4}
+	rc4, err := rc4Doc.Encrypt(NewPtr(12, 0), []byte(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		filter string
+		data   []byte
+	}{
+		{"StdCF", aes},
+		{"RC4F", rc4},
+		{"NoneF", []byte(content)},
+	}
+	for _, tt := range tests {
+		for _, params := range []struct {
+			shape string
+			parms Object
+		}{
+			{"DecodeParms array", Object{Kind: Array, ArrayVal: []Object{{Kind: Dict, DictVal: map[string]Object{"Name": name(tt.filter)}}}}},
+			{"DecodeParms dictionary", Object{Kind: Dict, DictVal: map[string]Object{"Name": name(tt.filter)}}},
+		} {
+			t.Run(tt.filter+" with a "+params.shape, func(t *testing.T) {
+				dict := map[string]Object{
+					"Filter":      {Kind: Array, ArrayVal: []Object{name("Crypt")}},
+					"DecodeParms": params.parms,
+				}
+				if got, err := readStreamData(r, dict, tt.data); got != content || err != nil {
+					t.Errorf("read %q, %v; want %q, nil", got, err, content)
+				}
+			})
+		}
+	}
+
+	t.Run("unknown filter", func(t *testing.T) {
+		dict := map[string]Object{
+			"Filter":      {Kind: Array, ArrayVal: []Object{name("Crypt")}},
+			"DecodeParms": {Kind: Array, ArrayVal: []Object{{Kind: Dict, DictVal: map[string]Object{"Name": name("NoSuchCF")}}}},
+		}
+		if got, err := readStreamData(r, dict, aes); err == nil {
+			t.Errorf("read %q, %v; want an error", got, err)
+		}
+	})
+}
+
+// TestNamedCryptFilterDocument reads a document whose page content stream names
+// a crypt filter other than the one of /StmF, end to end. qpdf 12.4 decrypts
+// this document to the same content.
+func TestNamedCryptFilterDocument(t *testing.T) {
+	const qpdfID = "31415926535897932384626433832795"
+	const content = "BT /F1 12 Tf 20 100 Td (Hello secret world) Tj ET"
+	// The file key of the AES-128 document that qpdf 12.4 wrote with user
+	// password "userpw", whose /Encrypt dictionary this document reuses.
+	rc4Doc := &Reader{key: mustHex(t, "567053e9cfea0f89ae6fbdb37334a454"), useAES: false, encVersion: 4}
+	enc, err := rc4Doc.Encrypt(NewPtr(4, 0), []byte(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d /Filter [/Crypt] /DecodeParms [<< /Type /CryptFilterDecodeParms /Name /RC4F >>] >>\nstream\n%s\nendstream",
+			len(enc), enc),
+		"<< /Filter /Standard /V 4 /R 4 /Length 128 /P -4" +
+			" /O <07c02079e0d8d0c3404477e977b56ef1720b2f6be2a464225fb7e72ffc05cc7f>" +
+			" /U <3eadea12150bd88e74ec04a486eabc780021446990b9e4114071a4d9104984c1>" +
+			" /CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV2 /Length 16 >>" +
+			" /RC4F << /AuthEvent /DocOpen /CFM /V2 /Length 16 >> >> /StmF /StdCF /StrF /StdCF >>",
+	}
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.6\n")
+	offsets := make([]int, len(objects))
+	for i, obj := range objects {
+		offsets[i] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", i+1, obj)
+	}
+	xrefPos := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(objects)+1)
+	for _, off := range offsets {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R /Encrypt 5 0 R /ID [<%s><%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		len(objects)+1, qpdfID, qpdfID, xrefPos)
+
+	data := buf.Bytes()
+	r, err := NewReaderEncrypted(bytes.NewReader(data), int64(len(data)), passwordOnce("userpw"))
+	if err != nil {
+		t.Fatalf("NewReaderEncrypted: %v", err)
+	}
+	if got := string(r.Page(1).V.Key("Contents").Data()); got != content {
+		t.Errorf("the page content is %q, want %q", got, content)
 	}
 }
 

@@ -34,9 +34,10 @@ type Reader struct {
 	trailerptr      objptr
 	key             []byte
 	useAES          bool
-	encVersion      int    // encryption version (V), 0 if not encrypted
-	encKey          []byte // File Encryption Key (FEK) - for V=5 calls this is the final key
-	plainMetadata   bool   // the document metadata stream is not encrypted (/EncryptMetadata false)
+	encVersion      int               // encryption version (V), 0 if not encrypted
+	encKey          []byte            // File Encryption Key (FEK) - for V=5 calls this is the final key
+	plainMetadata   bool              // the document metadata stream is not encrypted (/EncryptMetadata false)
+	cryptFilters    map[string]string // the method of each crypt filter of /CF, by name
 	XrefInformation ReaderXrefInformation
 	PDFVersion      string
 	closer          io.Closer
@@ -47,7 +48,15 @@ type Reader struct {
 
 	// objStms holds the object streams being searched, to detect cycles.
 	objStms []objptr
+	// Failures that depend on the object streams being searched must not be
+	// cached.
+	objStmLoops  int
+	objStmFailed bool
 }
+
+// maxObjStmDepth bounds the object streams searched at once, since a key of one,
+// such as /Length, may be in another. A long chain would overflow the stack.
+const maxObjStmDepth = 32
 
 type ReaderXrefInformation struct {
 	StartPos               int64
@@ -171,35 +180,14 @@ func newReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, e
 	end := size
 
 	// Some PDF's are quite broken and have a lot of stuff after %%EOF.
-	searchSize := int64(200)
-	searchSizeRead := int(0)
-
-EOFDetect:
-	for {
-		buf = make([]byte, searchSize)
-
-		searchSizeRead, _ = f.ReadAt(buf, end-searchSize)
-		buf = bytes.TrimRight(buf, "\r\n\t ")
-		for len(buf) >= 5 {
-			if bytes.HasSuffix(buf, []byte("%%EOF")) {
-				break EOFDetect
-			}
-
-			buf = buf[0 : len(buf)-1]
-		}
-
-		searchSize += 200
-
-		if searchSize > end {
-			return nil, fmt.Errorf("not a PDF file: missing %%%%EOF")
-		}
+	eof := findEOF(f, end)
+	if eof < 0 {
+		return nil, fmt.Errorf("not a PDF file: missing %%%%EOF")
 	}
 
-	eofPosition := len(buf)
-
-	// Read 200 bytes before the %%EOF.
-	buf = make([]byte, int64(200))
-	f.ReadAt(buf, end-(int64(searchSizeRead)-int64(eofPosition))-int64(len(buf)))
+	start := max(eof-200, 0)
+	buf = make([]byte, eof-start)
+	f.ReadAt(buf, start)
 
 	i := findLastLine(buf, "startxref")
 	if i < 0 {
@@ -216,7 +204,7 @@ EOFDetect:
 	if c, ok := f.(io.Closer); ok {
 		r.closer = c
 	}
-	pos := (end - (int64(searchSizeRead) - int64(eofPosition)) - int64(len(buf))) + int64(i)
+	pos := start + int64(i)
 
 	// Save the position of the startxref element.
 	r.XrefInformation.PositionStartPos = pos
@@ -317,9 +305,9 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 	}
 
 	// The table grows as the entries are read, so /Size only gives the initial
-	// capacity: a file that declares more objects than it can hold must not
-	// make the table that large.
-	table := make([]xref, 0, min(size, r.end, 4096))
+	// capacity: a file that declares a huge one must not make the table that
+	// large before a single entry is read.
+	table := make([]xref, 0, min(size, 4096))
 
 	table, err := readXrefStreamData(r, strm, table, size)
 	if err != nil {
@@ -367,7 +355,9 @@ func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 
 	// Save the xref type. Useful for adding data to it.
 	r.XrefInformation.Type = "stream"
-	r.XrefInformation.ItemCount = int64(len(table))
+	// Writers take the /Size of the next section from ItemCount, and it must not
+	// be smaller than this one, even if the table lists fewer objects.
+	r.XrefInformation.ItemCount = max(size, int64(len(table)))
 
 	return table, strmptr, strm, nil
 }
@@ -385,26 +375,27 @@ func readXrefStreamData(r *Reader, strm Object, table []xref, size int64) ([]xre
 		return nil, fmt.Errorf("xref stream missing W array")
 	}
 
+	// A field is at most 8 bytes wide, like in qpdf, and an entry takes at least
+	// one byte: an entry of no bytes would let a short /Index list any number.
 	var w []int
+	wtotal := 0
 	for _, x := range ww.ArrayVal {
 		i := x.Int64Val
-		if x.Kind != Integer || int64(int(i)) != i {
+		if x.Kind != Integer || i < 0 || i > 8 {
 			return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
 		}
 		w = append(w, int(i))
+		wtotal += int(i)
 	}
-	if len(w) < 3 {
+	if len(w) < 3 || wtotal == 0 {
 		return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
 	}
 
 	v := Value{r: r, obj: strm}
-	wtotal := 0
-	for _, wid := range w {
-		wtotal += wid
-	}
 	buf := make([]byte, wtotal)
 	data := v.Reader()
 
+	entries := int64(0)
 	idxArr := index.ArrayVal
 	for len(idxArr) > 0 {
 		start := idxArr[0].Int64Val
@@ -412,6 +403,10 @@ func readXrefStreamData(r *Reader, strm Object, table []xref, size int64) ([]xre
 		if idxArr[0].Kind != Integer || idxArr[1].Kind != Integer {
 			return nil, fmt.Errorf("malformed Index pair %v %v", objfmt(idxArr[0]), objfmt(idxArr[1]))
 		}
+		if n > maxObjects+1-entries {
+			return nil, fmt.Errorf("xref stream lists more than %d objects", maxObjects+1)
+		}
+		entries += max(n, 0)
 		idxArr = idxArr[2:]
 		for i := 0; i < int(n); i++ {
 			_, err := io.ReadFull(data, buf)
@@ -426,12 +421,12 @@ func readXrefStreamData(r *Reader, strm Object, table []xref, size int64) ([]xre
 
 			v2 := decodeInt(buf[w[0] : w[0]+w[1]])
 			v3 := decodeInt(buf[w[0]+w[1] : w[0]+w[1]+w[2]])
-			x, err := xrefIndex(start+int64(i), r.end)
+			x, err := xrefIndex(start + int64(i))
 			if err != nil {
 				return nil, err
 			}
-			for len(table) <= x {
-				table = append(table, xref{})
+			if x >= len(table) {
+				table = append(table, make([]xref, x+1-len(table))...)
 			}
 			if table[x].ptr != (objptr{}) {
 				continue
@@ -462,7 +457,7 @@ func decodeInt(b []byte) int {
 func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 	var table []xref
 
-	table, err := readXrefTableData(b, table, r.end)
+	table, err := readXrefTableData(b, table)
 	if err != nil {
 		return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: %v", err)
 	}
@@ -501,7 +496,7 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 		if tok.Kind != Keyword || tok.KeywordVal != "xref" {
 			return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: xref Prev does not point to xref")
 		}
-		table, err = readXrefTableData(b, table, r.end)
+		table, err = readXrefTableData(b, table)
 		if err != nil {
 			return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: %v", err)
 		}
@@ -518,6 +513,9 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 		return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: trailer missing /Size entry")
 	}
 	size := sizeObj.Int64Val
+	if size < 0 {
+		return nil, objptr{}, Object{Kind: Null}, fmt.Errorf("malformed PDF: negative trailer Size")
+	}
 
 	if size < int64(len(table)) {
 		table = table[:size]
@@ -538,17 +536,22 @@ func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, Object, error) {
 	return table, objptr{}, trailer, nil
 }
 
+// maxObjects is the architectural limit on the number of indirect objects in a
+// document (ISO 32000-1, Annex C.2), numbered 1 to maxObjects. It bounds the
+// cross-reference table, which a file would otherwise size with a single entry,
+// however few objects it holds.
+const maxObjects = 8388607
+
 // xrefIndex returns the object number x as an index into the cross-reference
-// table of a file of end bytes. Every object needs at least one byte in the
-// file, so a larger object number is malformed.
-func xrefIndex(x, end int64) (int, error) {
-	if x < 0 || x >= end {
-		return 0, fmt.Errorf("object number %d in a file of %d bytes", x, end)
+// table.
+func xrefIndex(x int64) (int, error) {
+	if x < 0 || x > maxObjects {
+		return 0, fmt.Errorf("object number %d over the limit of %d", x, maxObjects)
 	}
 	return int(x), nil
 }
 
-func readXrefTableData(b *buffer, table []xref, end int64) ([]xref, error) {
+func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 	for {
 		tok := b.readToken()
 		if tok.Kind == Keyword && tok.KeywordVal == "trailer" {
@@ -578,12 +581,12 @@ func readXrefTableData(b *buffer, table []xref, end int64) ([]xref, error) {
 			if alloc != "f" && alloc != "n" {
 				return nil, fmt.Errorf("malformed xref table entry: invalid type %q", alloc)
 			}
-			x, err := xrefIndex(start+int64(i), end)
+			x, err := xrefIndex(start + int64(i))
 			if err != nil {
 				return nil, err
 			}
-			for len(table) <= x {
-				table = append(table, xref{})
+			if x >= len(table) {
+				table = append(table, make([]xref, x+1-len(table))...)
 			}
 			if alloc == "n" && table[x].offset == 0 {
 				table[x] = xref{ptr: objptr{uint32(x), uint16(gen)}, offset: int64(off)}
@@ -591,6 +594,23 @@ func readXrefTableData(b *buffer, table []xref, end int64) ([]xref, error) {
 		}
 	}
 	return table, nil
+}
+
+// findEOF returns the offset just after the last %%EOF in f, or -1.
+func findEOF(f io.ReaderAt, end int64) int64 {
+	const chunk = 64 << 10
+	marker := []byte("%%EOF")
+	buf := make([]byte, chunk+len(marker)-1)
+	for hi := end; hi > 0; {
+		// The chunks overlap, for a marker across two of them.
+		lo := max(hi-chunk, 0)
+		n, _ := f.ReadAt(buf[:min(end, hi+int64(len(marker)-1))-lo], lo)
+		if i := bytes.LastIndex(buf[:n], marker); i >= 0 {
+			return lo + int64(i+len(marker))
+		}
+		hi = lo
+	}
+	return -1
 }
 
 func findLastLine(buf []byte, s string) int {
@@ -696,9 +716,18 @@ func (r *Reader) objectInStream(strm Value, ptr objptr) (Object, bool) {
 }
 
 func (r *Reader) resolve(parent objptr, x Object) (v Value) {
+	orig, loops := x, 0
+	if r != nil {
+		loops = r.objStmLoops
+	}
 	defer func() {
 		if e := recover(); e != nil {
-			v = Value{err: fmt.Errorf("panic resolving %v: %v", x, e)}
+			v = Value{err: fmt.Errorf("panic resolving %v: %v", objfmt(orig), e)}
+			// A chain of object streams would otherwise resolve a failing object
+			// once for each key of each stream.
+			if orig.Kind == Indirect && r != nil && r.objCache != nil && r.objStmLoops == loops {
+				r.objCache[orig.PtrVal.id] = v
+			}
 		}
 	}()
 
@@ -718,8 +747,12 @@ func (r *Reader) resolve(parent objptr, x Object) (v Value) {
 		}
 		var obj Object
 		if xref.inStream {
-			if slices.Contains(r.objStms, xref.stream) {
-				panic("cyclic object streams")
+			if slices.Contains(r.objStms, xref.stream) || len(r.objStms) >= maxObjStmDepth || r.objStmFailed {
+				// Otherwise each stream would search the next ones again for
+				// each of its keys.
+				r.objStmLoops++
+				r.objStmFailed = len(r.objStms) > 0
+				panic("cyclic or too deeply nested object streams")
 			}
 			// An object stream is a stream, and a stream is never stored in an
 			// object stream (ISO 32000-1, 7.5.7).
@@ -727,7 +760,12 @@ func (r *Reader) resolve(parent objptr, x Object) (v Value) {
 				panic("object stream in an object stream")
 			}
 			r.objStms = append(r.objStms, xref.stream)
-			defer func() { r.objStms = r.objStms[:len(r.objStms)-1] }()
+			defer func() {
+				r.objStms = r.objStms[:len(r.objStms)-1]
+				if len(r.objStms) == 0 {
+					r.objStmFailed = false
+				}
+			}()
 			strm := r.resolve(parent, Object{Kind: Indirect, PtrVal: xref.stream})
 			// The object stream is searched first, then the chain of the object
 			// streams it extends, each of them only once.
@@ -825,67 +863,95 @@ func newStreamReader(s Object, r *Reader) io.ReadCloser {
 
 	rd = io.NewSectionReader(r.f, s.StreamOffset, length)
 
-	if r.key != nil && !r.unencryptedStream(s) {
-		var err error
-		// We need the stream's object ID for decryption.
-		// Use s.PtrVal which should be set to definition ID if it was read via readObject.
-		// If s was created manually, PtrVal might be empty.
-		// But newStreamReader is usually called from resolved objects.
-
-		rd, err = decryptStream(r.key, r.useAES, r.encVersion, s.PtrVal, rd)
+	if r.key != nil {
+		// We need the stream's object ID for decryption. Use s.PtrVal, which
+		// readObject sets to the definition ID.
+		encrypted, useAES, err := r.streamCipher(s)
 		if err != nil {
 			return &errorReadCloser{err}
 		}
-	}
-
-	filters := val.Key("Filter")
-	if filters.Kind() == Name {
-		var err error
-		rd, err = applyFilter(rd, filters.Name(), val.Key("DecodeParms"))
-		if err != nil {
-			return &errorReadCloser{err}
-		}
-	} else if filters.Kind() == Array {
-		for i := 0; i < filters.Len(); i++ {
-			var err error
-			rd, err = applyFilter(rd, filters.Index(i).Name(), val.Key("DecodeParms").Index(i))
+		if encrypted {
+			rd, err = decryptStream(r.key, useAES, r.encVersion, s.PtrVal, rd)
 			if err != nil {
 				return &errorReadCloser{err}
 			}
 		}
 	}
 
+	names, params := streamFilters(val)
+	for i, name := range names {
+		var err error
+		rd, err = applyFilter(rd, name, params(i))
+		if err != nil {
+			return &errorReadCloser{err}
+		}
+	}
+
 	return ioutil.NopCloser(rd)
 }
 
-// unencryptedStream reports whether s is not encrypted in an encrypted document:
-// a cross-reference stream, the metadata stream of the catalog when
-// /EncryptMetadata is false, or a stream with the Identity crypt filter.
-func (r *Reader) unencryptedStream(s Object) bool {
-	switch s.DictVal["Type"].NameVal {
-	case "XRef":
-		return true
-	case "Metadata":
-		if r.plainMetadata && s.PtrVal == r.resolve(objptr{}, r.trailer.DictVal["Root"]).obj.DictVal["Metadata"].PtrVal {
-			return true
+// streamFilters returns the names of the filters of the stream s, and a function
+// that returns the parameters of the i-th one. Like pdf.js, it accepts a single
+// filter in an array, a single filter with its parameters in an array, and a
+// single DecodeParms dictionary for all the filters.
+func streamFilters(s Value) (names []string, params func(i int) Value) {
+	filter, decodeParms := s.Key("Filter"), s.Key("DecodeParms")
+	switch filter.Kind() {
+	case Name:
+		names = []string{filter.Name()}
+	case Array:
+		for i := 0; i < filter.Len(); i++ {
+			names = append(names, filter.Index(i).Name())
 		}
 	}
-	val := Value{r: r, obj: s}
-	filter, params := val.Key("Filter"), val.Key("DecodeParms")
-	if filter.Kind() == Array {
-		// A Crypt filter comes first.
-		filter = filter.Index(0)
+	params = func(i int) Value {
+		if decodeParms.Kind() == Array {
+			return decodeParms.Index(i)
+		}
+		return decodeParms
 	}
-	// One filter may have a single DecodeParms dictionary instead of an array.
-	if params.Kind() == Array {
-		params = params.Index(0)
-	}
-	if filter.Name() != "Crypt" {
-		return false
-	}
-	name := params.Key("Name").Name()
-	return name == "" || name == "Identity"
+	return names, params
 }
+
+// streamCipher reports whether the stream s is encrypted, and whether its crypt
+// filter uses AES. A cross-reference stream, the metadata stream of the catalog
+// when /EncryptMetadata is false, and a stream whose Crypt filter is Identity or
+// does not encrypt are not encrypted. A stream that names another crypt filter
+// of the document uses the method of that filter, not the one of /StmF.
+func (r *Reader) streamCipher(s Object) (encrypted, useAES bool, err error) {
+	switch s.DictVal["Type"].NameVal {
+	case "XRef":
+		return false, false, nil
+	case "Metadata":
+		if r.plainMetadata && s.PtrVal == r.resolve(objptr{}, r.trailer.DictVal["Root"]).obj.DictVal["Metadata"].PtrVal {
+			return false, false, nil
+		}
+	}
+	// A Crypt filter comes first.
+	names, params := streamFilters(Value{r: r, obj: s})
+	if len(names) == 0 || names[0] != "Crypt" {
+		return true, r.useAES, nil
+	}
+	name := params(0).Key("Name").Name()
+	if name == "" || name == "Identity" {
+		return false, false, nil
+	}
+	switch method := r.cryptFilters[name]; method {
+	case "Identity", "None":
+		return false, false, nil
+	case "V2":
+		return true, false, nil
+	case "AESV2", "AESV3":
+		return true, true, nil
+	case "":
+		return false, false, fmt.Errorf("undefined crypt filter %s", name)
+	default:
+		return false, false, fmt.Errorf("unsupported PDF: crypt filter method %s", method)
+	}
+}
+
+// maxColumns bounds the /Columns of a predictor, whose rows are buffered.
+const maxColumns = 1 << 24
 
 func applyFilter(rd io.Reader, name string, param Value) (io.Reader, error) {
 	switch name {
@@ -908,6 +974,9 @@ func applyFilter(rd io.Reader, name string, param Value) (io.Reader, error) {
 			return zr, nil
 		}
 		columns := param.Key("Columns").Int64()
+		if columns < 0 || columns > maxColumns {
+			return nil, fmt.Errorf("invalid predictor Columns %d", columns)
+		}
 		switch pred.Int64() {
 		default:
 			return nil, fmt.Errorf("unknown predictor %v", pred)
@@ -1032,6 +1101,12 @@ func (r *Reader) initEncrypt(password string) error {
 			useAES = true
 		default:
 			return fmt.Errorf("unsupported PDF: crypt filter method %s for V=%d", stmf, V)
+		}
+		// A stream may name any of the crypt filters, not only the one of /StmF.
+		cf := r.resolve(objptr{}, encrypt["CF"])
+		r.cryptFilters = make(map[string]string)
+		for _, name := range cf.Keys() {
+			r.cryptFilters[name] = r.cryptFilterMethod(encrypt, name)
 		}
 	}
 
@@ -1352,12 +1427,16 @@ func (r *Reader) EncryptsMetadata() bool {
 	return r.key != nil && !r.plainMetadata
 }
 
-// Encrypt encrypts a string or stream of the object ptr with the document's key.
+// Encrypt encrypts a string or stream of the object ptr with the document's key,
+// using the method of the document's default crypt filters (/StmF and /StrF).
 // Some data of an encrypted document stays unencrypted and must not be passed to
 // Encrypt: cross-reference streams and their strings, the Contents of signature
 // dictionaries, the strings of objects in object streams, streams whose first
-// filter is /Crypt with the /Identity crypt filter or no /Name, and the metadata
-// stream of the catalog if EncryptsMetadata reports false.
+// filter is /Crypt with the /Identity crypt filter, no /Name or a crypt filter
+// whose method is /None, and the metadata stream of the catalog if
+// EncryptsMetadata reports false. A stream whose first filter is /Crypt with
+// another crypt filter is decrypted with the method of that filter, so Encrypt
+// suits it only if that method is the default one.
 func (r *Reader) Encrypt(ptr Ptr, data []byte) ([]byte, error) {
 	if r.key == nil {
 		return nil, fmt.Errorf("encrypt: document is not encrypted")
@@ -1425,7 +1504,12 @@ func decryptStream(key []byte, useAES bool, encVersion int, ptr objptr, rd io.Re
 		}
 
 		iv := make([]byte, aes.BlockSize)
-		if _, err := io.ReadFull(rd, iv); err != nil {
+		if n, err := io.ReadFull(rd, iv); err != nil {
+			// An empty stream may have no IV, and /Length may count the
+			// end-of-line marker before endstream, as cbcReader allows.
+			if err == io.ErrUnexpectedEOF && !slices.ContainsFunc(iv[:n], func(c byte) bool { return !isSpace(c) }) {
+				return bytes.NewReader(nil), nil
+			}
 			return nil, err
 		}
 

@@ -2,10 +2,12 @@ package pdf
 
 import (
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -302,6 +304,54 @@ func allocatedBy(f func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
+// compressedXrefFile returns a document of a few hundred bytes whose Flate
+// encoded cross-reference stream holds n entries: the catalog, the stream
+// itself and free entries.
+func compressedXrefFile(n int) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.5\n")
+	catalog := buf.Len()
+	buf.WriteString("1 0 obj\n<< /Type /Catalog >>\nendobj\n")
+	stream := buf.Len()
+
+	entries := make([]byte, 0, 4*n)
+	entry := func(t byte, off int, gen byte) { entries = append(entries, t, byte(off>>8), byte(off), gen) }
+	entry(0, 65535, 255)
+	entry(1, catalog, 0)
+	entry(1, stream, 0)
+	for i := 3; i < n; i++ {
+		entry(0, 0, 0)
+	}
+	var data bytes.Buffer
+	zw := zlib.NewWriter(&data)
+	zw.Write(entries)
+	zw.Close()
+
+	fmt.Fprintf(&buf, "2 0 obj\n<< /Type /XRef /Size %d /W [1 2 1] /Filter /FlateDecode /Root 1 0 R /Length %d >>\nstream\n",
+		n, data.Len())
+	buf.Write(data.Bytes())
+	buf.WriteString("\nendstream\nendobj\n")
+	fmt.Fprintf(&buf, "startxref\n%d\n%%%%EOF\n", stream)
+	return buf.Bytes()
+}
+
+// TestCompressedXrefStreamEntries reads a document whose cross-reference stream
+// holds far more entries than the file has bytes, which Flate makes possible.
+func TestCompressedXrefStreamEntries(t *testing.T) {
+	const n = 10001
+	data := compressedXrefFile(n)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader for %d entries in %d bytes: %v", n, len(data), err)
+	}
+	if got := r.Trailer().Key("Root").Key("Type").Name(); got != "Catalog" {
+		t.Errorf("Root is %q, want the Catalog", got)
+	}
+	if len(r.Xref()) != n {
+		t.Errorf("the xref table has %d entries, want %d", len(r.Xref()), n)
+	}
+}
+
 // TestHugeDeclaredXrefSize reads a document whose /Size is far larger than the
 // file, which must not make the cross-reference table that large.
 func TestHugeDeclaredXrefSize(t *testing.T) {
@@ -323,9 +373,9 @@ func TestHugeDeclaredXrefSize(t *testing.T) {
 	}
 }
 
-// TestXrefObjectNumberBeyondFile reads documents that number an object beyond
-// the end of the file, which cannot be a real object.
-func TestXrefObjectNumberBeyondFile(t *testing.T) {
+// TestXrefObjectNumberOverLimit reads documents that number an object over the
+// architectural limit, which must not size the cross-reference table.
+func TestXrefObjectNumberOverLimit(t *testing.T) {
 	var table bytes.Buffer
 	table.WriteString("%PDF-1.7\n%" + strings.Repeat("x", 300) + "\n")
 	catalog := table.Len()
@@ -528,5 +578,197 @@ func TestMalformedObjectStreams(t *testing.T) {
 				t.Errorf("GetObject(%d): got no error", tt.id)
 			}
 		})
+	}
+}
+
+// The next section written must not declare a smaller /Size.
+func TestXrefStreamItemCount(t *testing.T) {
+	data := xrefStreamFile(20, 0)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if r.XrefInformation.ItemCount != 20 {
+		t.Errorf("ItemCount = %d, want the /Size 20", r.XrefInformation.ItemCount)
+	}
+}
+
+func TestXrefIndexLimit(t *testing.T) {
+	if _, err := xrefIndex(maxObjects); err != nil {
+		t.Errorf("xrefIndex(%d): %v", maxObjects, err)
+	}
+	if _, err := xrefIndex(maxObjects + 1); err == nil {
+		t.Errorf("xrefIndex(%d): got no error", maxObjects+1)
+	}
+}
+
+func xrefTableFile(trailer string) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.7\n")
+	catalog := buf.Len()
+	buf.WriteString("1 0 obj\n<< /Type /Catalog >>\nendobj\n")
+	xref := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 2\n0000000000 65535 f \n%010d 00000 n \ntrailer\n%s\nstartxref\n%d\n%%%%EOF\n",
+		catalog, trailer, xref)
+	return buf.Bytes()
+}
+
+func TestShortFile(t *testing.T) {
+	data := xrefTableFile("<< /Size 2 /Root 1 0 R >>")
+	if len(data) >= 200 {
+		t.Fatalf("the document has %d bytes, want less than 200", len(data))
+	}
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader for %d bytes: %v", len(data), err)
+	}
+	if got := r.Trailer().Key("Root").Key("Type").Name(); got != "Catalog" {
+		t.Errorf("Root is %q, want the Catalog", got)
+	}
+}
+
+func TestNegativeTrailerSize(t *testing.T) {
+	data := xrefTableFile("<< /Size -1 /Root 1 0 R >>")
+	if _, err := NewReader(bytes.NewReader(data), int64(len(data))); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Errorf("NewReader: got %v, want an error about the negative /Size", err)
+	}
+}
+
+func TestDataAfterEOF(t *testing.T) {
+	doc := xrefTableFile("<< /Size 2 /Root 1 0 R >>")
+	// 65532 bytes after the end of the document put %%EOF across two of the
+	// chunks that findEOF reads.
+	for _, n := range []int{65532, 4 << 20} {
+		data := append(slices.Clone(doc), bytes.Repeat([]byte("x"), n)...)
+		var err error
+		if !runWithin(t, func() { _, err = NewReader(bytes.NewReader(data), int64(len(data))) }) {
+			t.Fatalf("NewReader for %d bytes after %%%%EOF did not return", n)
+		}
+		if err != nil {
+			t.Errorf("NewReader for %d bytes after %%%%EOF: %v", n, err)
+		}
+	}
+
+	data := bytes.Repeat([]byte("x"), 4<<20)
+	copy(data, doc[:len(doc)-7])
+	var err error
+	if !runWithin(t, func() { _, err = NewReader(bytes.NewReader(data), int64(len(data))) }) {
+		t.Fatal("NewReader for a document without the EOF marker did not return")
+	}
+	if err == nil {
+		t.Error("NewReader for a document without the EOF marker: got no error")
+	}
+}
+
+func TestInvalidXrefStreamFields(t *testing.T) {
+	pairs := strings.Repeat(" 0 8388606", 20)
+	tests := []struct{ name, w, index string }{
+		{"huge field", "/W [1 2 250000000000000]", ""},
+		{"huge fourth field", "/W [1 2 1 250000000000000]", ""},
+		{"negative field", "/W [1 -2 1]", ""},
+		{"empty entries", "/W [0 0 0]", "/Index [" + pairs + "]"},
+		{"too many entries", "", "/Index [0 3" + pairs + "]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := xrefStreamFile(3, 0)
+			if tt.w != "" {
+				data = bytes.Replace(data, []byte("/W [1 2 1]"), []byte(tt.w), 1)
+			}
+			if tt.index != "" {
+				data = bytes.Replace(data, []byte("/Index [0 3]"), []byte(tt.index), 1)
+			}
+			var err error
+			if !runWithin(t, func() { _, err = NewReader(bytes.NewReader(data), int64(len(data))) }) {
+				t.Fatal("NewReader did not return")
+			}
+			if err == nil {
+				t.Error("NewReader: got no error")
+			}
+		})
+	}
+}
+
+func TestPredictorColumnsOverLimit(t *testing.T) {
+	var data bytes.Buffer
+	zw := zlib.NewWriter(&data)
+	zw.Close()
+	for _, columns := range []int64{-2, 1 << 40} {
+		param := Value{obj: Object{Kind: Dict, DictVal: map[string]Object{
+			"Predictor": {Kind: Integer, Int64Val: 12},
+			"Columns":   {Kind: Integer, Int64Val: columns},
+		}}}
+		if _, err := applyFilter(bytes.NewReader(data.Bytes()), "FlateDecode", param); err == nil {
+			t.Errorf("applyFilter for /Columns %d: got no error", columns)
+		}
+	}
+}
+
+func TestFilterParameterShapes(t *testing.T) {
+	var data bytes.Buffer
+	zw := zlib.NewWriter(&data)
+	zw.Write([]byte{2, 1, 2, 2, 2, 2})
+	zw.Close()
+
+	flate := Object{Kind: Name, NameVal: "FlateDecode"}
+	params := Object{Kind: Dict, DictVal: map[string]Object{
+		"Predictor": {Kind: Integer, Int64Val: 12},
+		"Columns":   {Kind: Integer, Int64Val: 2},
+	}}
+	array := func(x Object) Object { return Object{Kind: Array, ArrayVal: []Object{x}} }
+	tests := []struct {
+		name           string
+		filter, params Object
+	}{
+		{"name and dictionary", flate, params},
+		{"arrays", array(flate), array(params)},
+		{"array and dictionary", array(flate), params},
+		{"name and array", flate, array(params)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := readStreamData(&Reader{}, map[string]Object{"Filter": tt.filter, "DecodeParms": tt.params}, data.Bytes())
+			if got != "\x01\x02\x03\x04" || err != nil {
+				t.Errorf("read %q, %v; want %q, nil", got, err, "\x01\x02\x03\x04")
+			}
+		})
+	}
+}
+
+// A chain shorter than maxObjStmDepth fails at its end, and a longer one at
+// that depth.
+func TestObjectStreamChain(t *testing.T) {
+	for _, k := range []int{20, 100} {
+		t.Run(fmt.Sprint(k), func(t *testing.T) { testObjectStreamChain(t, k) })
+	}
+}
+
+func testObjectStreamChain(t *testing.T, k int) {
+	const first = 1000
+	var streams []string
+	for i := 1; i <= k; i++ {
+		n := first + 4*(i+1)
+		streams = append(streams, fmt.Sprintf(
+			"<< /Type /ObjStm /N %d 0 R /First 4 /Length %d 0 R /Filter %d 0 R /Extends %d 0 R >>\nstream\n0 0 null\nendstream",
+			n, n+1, n+2, n+3))
+	}
+	r := &Reader{}
+	setObjects(r, streams...)
+	r.xref = append(r.xref, make([]xref, first+4*(k+2)-len(r.xref))...)
+	for i := 1; i <= k+1; i++ {
+		for id := uint32(first + 4*i); id < uint32(first+4*i+4); id++ {
+			r.xref[id] = xref{ptr: objptr{id: id}, inStream: true, stream: objptr{id: uint32(i)}}
+		}
+	}
+
+	var v Value
+	if !runWithin(t, func() { v, _ = r.GetObject(first + 4) }) {
+		t.Fatal("GetObject did not return")
+	}
+	if v.Err() == nil {
+		t.Fatal("GetObject: got no error")
+	}
+	if want := fmt.Sprintf("%d 0 R", first+4); !strings.Contains(v.Err().Error(), want) {
+		t.Errorf("GetObject: error %q does not name %s", v.Err(), want)
 	}
 }
